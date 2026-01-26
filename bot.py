@@ -135,7 +135,12 @@ async def digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    token = os.environ["BOT_TOKEN"]
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+    # Диагностика: покажем какие env ключи вообще доступны (без значений)
+        keys = sorted([k for k in os.environ.keys() if "TOKEN" in k or "SUPABASE" in k or k.startswith("TG_")])
+        raise RuntimeError(f"BOT_TOKEN is missing. Visible env keys: {keys}")
+
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
