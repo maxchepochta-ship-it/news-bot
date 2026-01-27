@@ -1,57 +1,66 @@
 import os
+import json
+from typing import List, Dict
 from openai import OpenAI
 
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-SYSTEM = (
-    "Ты — новостной редактор и агрегатор для редакции медиа. "
-    "Ты НЕ выдумываешь факты, работаешь строго по входным данным. "
-    "Если информации недостаточно — так и скажи."
-)
+SYSTEM_PROMPT = """
+Ты — редактор новостей. Твоя задача — обработать список новостных постов
+и вернуть СТРОГО JSON по заданной схеме.
 
-def build_prompt(theme: str, start: str, end: str, items: list[dict]) -> str:
-    items = items[:60]  # ограничим объём для MVP
-
-    lines = []
-    for it in items:
-        published = it.get("published_at", "")
-        channel = it.get("channel", "")
-        text = (it.get("text") or "").strip()
-        url = it.get("url") or ""
-        if not text and url:
-            text = "(пост без текста, только ссылка)"
-        lines.append(f"- [{channel}] {published}\n  {text}\n  {url}")
-
-    joined = "\n".join(lines)
-
-    return f"""
-ТЕМА: {theme}
-ПЕРИОД: {start} — {end}
-
-Вот список новостей/постов:
-{joined}
-
-ЗАДАЧА:
-1) Сгруппируй по сюжетам (одно событие = один сюжет)
-2) Для каждого сюжета:
-   - заголовок
-   - 2–4 предложения описания (без выдумок)
-   - список источников со ссылками
-   - уникальные детали: что добавил каждый источник (если есть)
-3) Выдели один главный сюжет (если он очевиден), иначе пропусти этот блок
-4) В конце: статистика (сколько постов было → сколько сюжетов получилось)
-
-ФОРМАТ:
-Верни аккуратный Markdown, пригодный для отправки в Telegram.
+Правила:
+- Не выдумывай факты
+- Используй только переданные посты
+- Группируй новости, если они об одном событии
+- importance: число от 1 до 5
+- Главные сюжеты — это importance >= 4 и минимум 2 источника
+- Верни ТОЛЬКО JSON, без текста вокруг
 """
 
-def make_digest(theme: str, start: str, end: str, items: list[dict]) -> str:
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
+def build_user_prompt(items: List[Dict]) -> str:
+    return f"""
+Вот список новостных постов (JSON):
+
+{json.dumps(items, ensure_ascii=False)}
+
+Верни результат строго в формате:
+
+{{
+  "summary": "Краткая выжимка главных событий одним абзацем",
+  "stories": [
+    {{
+      "title": "Название сюжета",
+      "importance": 1,
+      "summary": "Краткое описание сюжета (2–4 предложения)",
+      "items": [
+        {{
+          "channel": "название источника",
+          "published_at": "ISO дата",
+          "url": "ссылка",
+          "unique_detail": "что уникального сообщил этот источник"
+        }}
+      ]
+    }}
+  ]
+}}
+"""
+
+def process_posts_with_llm(posts: List[Dict]) -> Dict:
+    model = os.getenv("LLM_MODEL", "gpt-4.1-mini")
+    max_items = int(os.getenv("LLM_MAX_ITEMS", "40"))
+
+    trimmed = posts[:max_items]
+
+    response = client.responses.create(
+        model=model,
         temperature=0.2,
+        response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": build_prompt(theme, start, end, items)},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_prompt(trimmed)},
         ],
     )
-    return resp.choices[0].message.content.strip()
+
+    text = response.output_text
+    return json.loads(text)
