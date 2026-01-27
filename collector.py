@@ -22,19 +22,11 @@ def normalize_text(msg: Message) -> str:
     return " ".join(t.split())
 
 
-def _no_input(*args, **kwargs):
-    """
-    На сервере (Railway) нельзя просить интерактивный ввод (телефон/код/2FA).
-    Если Telethon попробует — значит TG_SESSION невалидна/не подхватилась.
-    """
-    raise RuntimeError(
-        "Telethon attempted interactive login on server. "
-        "Check TG_SESSION (must be full StringSession), TG_API_ID, TG_API_HASH."
-    )
-
-
 async def collect_recent(theme: str, hours: int = 12, limit_per_channel: int = 60) -> int:
-    # --- обязательные env ---
+    """
+    Собирает свежие посты из Telegram-каналов (public) через Telethon и сохраняет в Supabase.
+    На Railway работает без интерактивного ввода благодаря StringSession в переменной окружения TG_SESSION.
+    """
     api_id_raw = os.environ.get("TG_API_ID")
     api_hash = os.environ.get("TG_API_HASH")
     tg_session = os.environ.get("TG_SESSION")
@@ -50,17 +42,7 @@ async def collect_recent(theme: str, hours: int = 12, limit_per_channel: int = 6
     except ValueError:
         raise RuntimeError("TG_API_ID must be an integer")
 
-    # --- Telethon клиент на StringSession (без файловой сессии) ---
     client = TelegramClient(StringSession(tg_session), api_id, api_hash)
-
-    # Форсируем non-interactive поведение:
-    # если сессия невалидна, Telethon попытается спросить телефон/код — мы дадим понятную ошибку
-    client.start(phone=_no_input, password=_no_input, code_callback=_no_input)
-
-    # Проверка, что сессия реально авторизована
-    me = await client.get_me()
-    if not me:
-        raise RuntimeError("Telethon session invalid: get_me() returned None. Re-generate TG_SESSION.")
 
     sources = get_active_sources(theme)
     if not sources:
@@ -70,7 +52,14 @@ async def collect_recent(theme: str, hours: int = 12, limit_per_channel: int = 6
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     saved = 0
 
+    # ВАЖНО: всё делаем внутри async with client, чтобы соединение было установлено
     async with client:
+        me = await client.get_me()
+        if not me:
+            raise RuntimeError(
+                "Telethon session invalid: get_me() returned None. Re-generate TG_SESSION."
+            )
+
         for channel in sources:
             try:
                 entity = await client.get_entity(channel)
