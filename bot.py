@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import dotenv
 from supabase import create_client
@@ -8,31 +9,38 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from collector import collect_recent
 from db import fetch_posts_for_period, upsert_chat
-from digest_simple import make_digest_simple as make_digest
+from digest_simple import make_digest_simple
+from digest_full import make_digest_full
 
-# Важно: чтобы .env грузился стабильно, указываем явно
-dotenv.load_dotenv(".env")
+
+# --- локальная загрузка .env (на Railway .env нет, там только Variables) ---
+if Path(".env").exists():
+    dotenv.load_dotenv(".env")
 
 
 def iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+def make_digest(theme: str, start: str, end: str, items):
+    # Явный переключатель режимов
+    if os.getenv("LLM_MODE", "simple").lower() == "full":
+        return make_digest_full(theme, start, end, items)
+    return make_digest_simple(theme, start, end, items)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /start:
     1) Регистрирует текущий чат (личка/группа) в таблице chats
-    2) Сразу читает запись обратно и показывает диагностический ответ
-       (чтобы мы точно понимали, что запись реально попала в БД).
+    2) Делает read-back (диагностика), чтобы убедиться, что запись реально в БД
     """
     theme = os.getenv("THEME", "technology")
     chat = update.effective_chat
 
     try:
-        # 1) Пишем (upsert) чат в БД
         upsert_chat(chat.id, chat.type, getattr(chat, "title", None), theme)
 
-        # 2) Читаем обратно из БД (read-back), чтобы доказать, что запись реально есть
         sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
         res = (
             sb.table("chats")
@@ -50,11 +58,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"read_back_rows={len(res.data or [])}\n"
             f"row={res.data[0] if (res.data or []) else None}"
         )
+
     except Exception as e:
         await update.message.reply_text(
             f"⚠️ Ошибка регистрации чата в БД: {type(e).__name__}: {e}"
         )
-        # Всё равно покажем help, чтобы бот был пригоден даже если БД временно не работает
         await update.message.reply_text(
             "Команды:\n"
             "/digest — собрать дайджест\n"
@@ -66,9 +74,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я MVP-бот для мониторинга новостей.\n\n"
         "Команды:\n"
-        "/digest — собрать дайджест (по умолчанию за 12 часов)\n"
-        "/help — справка\n\n"
-        "MVP: тема задаётся переменной THEME в .env"
+        "/digest — собрать дайджест\n"
+        "/help — справка\n"
     )
 
 
@@ -85,29 +92,35 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     theme = os.getenv("THEME", "technology")
+    mode = os.getenv("LLM_MODE", "simple").lower()
 
     now = datetime.now(timezone.utc)
-
-    # Окно дайджеста: из env, по умолчанию 12 часов
     period_hours = int(os.getenv("DIGEST_HOURS", "12"))
     start_dt = now - timedelta(hours=period_hours)
 
-    await update.message.reply_text("⏳ Собираю новости и готовлю дайджест...")
+    await update.message.reply_text(
+        "⏳ Собираю новости и готовлю дайджест...\n"
+        f"🤖 Режим: {mode}\n"
+        f"🧭 Тема: {theme}\n"
+        f"🕒 Окно: {period_hours}ч (UTC)"
+    )
 
-    # 1) Сначала подтянем свежие посты (чуть шире окна, чтобы точно покрыть период)
+    # 1) Подтянуть свежие посты
     try:
         await collect_recent(theme=theme, hours=max(period_hours, 12))
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка сбора постов: {type(e).__name__}: {e}")
+        await update.message.reply_text(
+            f"⚠️ Ошибка сбора постов: {type(e).__name__}: {e}"
+        )
         return
 
     # 2) Берем посты за окно
     items = fetch_posts_for_period(theme, iso(start_dt), iso(now))
 
-    # Диагностика (можно оставить на время отладки)
     await update.message.reply_text(
-        f"🔎 Из БД: {len(items)} постов за последние {period_hours}ч (UTC)\n"
-        f"start={iso(start_dt)}\nend={iso(now)}"
+        f"🔎 Из БД: {len(items)} постов\n"
+        f"start={iso(start_dt)}\n"
+        f"end={iso(now)}"
     )
 
     if not items:
@@ -116,36 +129,53 @@ async def digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Проверь:\n"
             "1) sources для этой темы\n"
             "2) что collector пишет в posts\n"
-            "3) увеличь DIGEST_HOURS в .env"
+            "3) увеличь DIGEST_HOURS"
         )
         return
 
-    # 3) Simple-дайджест (без LLM)
+    # 3) Генерация дайджеста (simple или full)
     try:
+        await update.message.reply_text(
+            "🧠 Генерирую дайджест через LLM..." if mode == "full" else "📝 Генерирую простой дайджест..."
+        )
         content = make_digest(theme, iso(start_dt), iso(now), items)
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка дайджеста: {type(e).__name__}: {e}")
+        await update.message.reply_text(
+            f"⚠️ Ошибка генерации дайджеста: {type(e).__name__}: {e}"
+        )
         return
 
-    # 4) Телеграм лимит по длине — на MVP просто обрежем
+    # 4) Telegram лимит
     if len(content) > 3500:
         content = content[:3500] + "\n\n…(обрезано из-за лимита Telegram)"
 
     await update.message.reply_text(content)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Глобальный хендлер ошибок, чтобы не было "No error handlers..."
+    try:
+        msg = f"⚠️ Unhandled error: {context.error}"
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(msg)
+    except Exception:
+        pass
+
+
 def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
-    # Диагностика: покажем какие env ключи вообще доступны (без значений)
-        keys = sorted([k for k in os.environ.keys() if "TOKEN" in k or "SUPABASE" in k or k.startswith("TG_")])
-        raise RuntimeError(f"BOT_TOKEN is missing. Visible env keys: {keys}")
+        # Не падаем в crash loop. Просто лог и выход.
+        print("BOT_TOKEN is missing. Set it in Railway Variables (Production) or in local .env.")
+        return
 
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("digest", digest))
+
+    app.add_error_handler(on_error)
 
     app.run_polling()
 
