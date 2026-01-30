@@ -60,3 +60,29 @@ def get_active_chats(theme: str) -> list[dict]:
         .execute()
     )
     return res.data or []
+
+def get_chat_settings(chat_id: int) -> dict:
+    sb = get_supabase()
+    res = (
+        sb.table("chats")
+        .select("chat_id,theme,include_keywords,exclude_keywords,is_active")
+        .eq("chat_id", chat_id)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else {}
+
+
+def update_chat_filters(chat_id: int, include_keywords: str | None = None, exclude_keywords: str | None = None) -> None:
+    sb = get_supabase()
+    payload = {}
+    if include_keywords is not None:
+        payload["include_keywords"] = include_keywords
+    if exclude_keywords is not None:
+        payload["exclude_keywords"] = exclude_keywords
+
+    if not payload:
+        return
+
+    sb.table("chats").update(payload).eq("chat_id", chat_id).execute()
